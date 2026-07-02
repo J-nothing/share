@@ -1,0 +1,7 @@
+#coding:utf-8
+#无人机位置初始化
+from UnityQUAVapi import UnityQUAV
+import time
+uQUAV = UnityQUAV()
+uQUAV.Reset()
+uQUAV.Show()

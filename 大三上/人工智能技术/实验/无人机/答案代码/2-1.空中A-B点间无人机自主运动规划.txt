@@ -1,0 +1,163 @@
+#coding:utf-8
+from UnityQUAVapi import UnityQUAV
+import UnityQUAVapi
+import time
+import numpy as np
+from scipy.special import comb
+
+
+class BezierSolver:
+    def __init__(self):
+        pass
+
+    def SolvePoly5(self, Dm0, Dm1, DDm0, DDm1, t):
+        '''
+            输入参数Dm0,Dm1,DDm0,DDm1为标量，t为时间行向量
+            输出参数C为多项式系数行向量[c0 c1 c2 c3 c4 c5]
+            输出参数m为函数值行向量m(t)
+                m(t)要求t从0变到tf,m从0变到1
+                m取值不得超出[0,1]区间
+                m(0)==0;        m(tf)==1;
+                m'(0)==Dm0;     m'(tf)==Dm1;
+                m''(0)==DDm0;   m''(tf)==DDm1;
+            取五次多项式曲线m(t)=[c0 c1 c2 c3 c4 c5]*[t.^0; t.^1; t.^2; t.^3; t.^4; t.^5]即可
+        '''
+        tf = t[-1]
+        b = np.asarray([0, 1, Dm0, Dm1, DDm0, DDm1]).reshape([6, 1])
+        A=np.asarray([ \
+                       1,0,0,0,0,0,
+                       1,tf,tf**2,tf**3,tf**4,tf**5,
+                       0,1,0,0,0,0,
+                       0,1,2*tf,3*tf**2,4*tf**3,5*tf**4,
+                       0,0,2,0,0,0,
+                       0,0,2,6*tf,12*tf**2,20*tf**3
+                    ]).reshape([6, 6])
+        C = np.linalg.inv(A).dot(b).T
+        tM = np.vstack([t * 0 + 1, t**1, t**2, t**3, t**4, t**5])
+        m = C.dot(tM)
+        return m
+
+    def Solve_B5Special_SE(self, Xs, Xe, Vs, Ve, As, Ae, Dms=[1, 1, 0, 0]):
+        '''
+            Xs,Xe,Vs,Ve,As,Ae均为numpy.ndarray类型，且shape为(3, 1)
+            即传入的都是三维列向量
+            依次代表起止的位置、速度、加速度
+            本函数利用五阶贝塞尔进行两点间轨迹规划，随便求一个可行解就行
+        '''
+        Dm0 = Dms[0]
+        Dm1 = Dms[1]
+        DDm0 = Dms[2]
+        DDm1 = Dms[3]
+        P0 = Xs
+        P5 = Xe
+        P1 = P0 + Vs / 5 / Dm0
+        P2 = (As - Vs / Dm0 * DDm0) / (20 * Dm0 * Dm0) - P0 + 2 * P1
+        P4 = P5 - Ve / 5 / Dm1
+        P3 = (Ae - Ve / Dm1 * DDm1) / (20 * Dm1 * Dm1) - P5 + 2 * P4
+
+        Pc = np.column_stack([P0, P1, P2, P3, P4, P5])
+        M0 = np.row_stack([0.0, Dm0, DDm0])  #[m(0) ; m'(0) ; m''(0)]
+        M1 = np.row_stack([1, Dm1, DDm1])  #[m(tf) ; m'(tf) ; m''(tf)]
+        return Pc, M0, M1
+
+    def Solve_B5Special(self, keyX, keyV, keyA, Dms=[0.05, 0.05, 0, 0]):
+        '''
+            PcsMse每三行存相邻两关键点之间规划得到的贝塞尔曲线信息[P M0 M1]
+            P为3行BezierN+1列，为各个控制点并联
+            M0为3行1列，为[m(0) ; m'(0) ; m''(0)]
+            M1为3行1列，为[m(tf) ; m'(tf) ; m''(tf)]
+        '''
+        keyN = keyX.shape[1]
+        BezierN = 5
+        PcsMse = np.zeros([3 * (keyN - 1), BezierN + 1 + 2], dtype=np.float64)
+        #遍历关键点序列，对每组相邻两关键点求解
+        for k in range(0, keyN - 1):
+            Xs = keyX[:, k].copy()
+            Xe = keyX[:, k + 1].copy()
+            Vs = keyV[:, k].copy()
+            Ve = keyV[:, k + 1].copy()
+            As = keyA[:, k].copy()
+            Ae = keyA[:, k + 1].copy()
+            Pc, M0, M1 = self.Solve_B5Special_SE(Xs, Xe, Vs, Ve, As, Ae, Dms)
+            PcsMse[3 * k:(3 * k + 3), 0:(BezierN + 1)] = Pc
+            PcsMse[3 * k:(3 * k + 3), BezierN + 1] = M0[:, 0]
+            PcsMse[3 * k:(3 * k + 3), BezierN + 2] = M1[:, 0]
+        return PcsMse
+
+    def GetPt(self, PcsMse, tf=1, tN=300):
+        '''
+            Pts每三行存一段时域轨迹的x y z坐标
+        '''
+        t = np.linspace(0, tf, tN)
+        keyN = int(PcsMse.shape[0] / 3)
+        BezierN = PcsMse.shape[1] - 2 - 1
+        C=np.asarray( \
+                      [comb(BezierN,k) for k in range(0,BezierN+1)],
+                      dtype=np.float64
+                    ).reshape([BezierN+1,1])
+        Pts = np.zeros([keyN * 3, tN])
+        for k in range(0, keyN):
+            Pc = PcsMse[(k * 3):(k * 3 + 3), 0:6]
+            Dm0 = PcsMse[k * 3 + 1, 6]
+            Dm1 = PcsMse[k * 3 + 1, 7]
+            DDm0 = PcsMse[k * 3 + 2, 6]
+            DDm1 = PcsMse[k * 3 + 2, 7]
+            m = self.SolvePoly5(Dm0, Dm1, DDm0, DDm1, t)
+            RList = [(m**k) * (1 - m)**(BezierN - k)
+                     for k in range(0, BezierN + 1)]
+            Pts[(k * 3):(k * 3 + 3), :] = Pc.dot(C * np.row_stack(RList))
+        return Pts
+
+    def ShowPlot3(self, PcsMse, Pts):
+        '''
+            绘制三维可视化结果
+        '''
+        import matplotlib as mplt
+        import matplotlib.pyplot as plt
+        from mpl_toolkits.mplot3d import Axes3D
+        plt.rcParams['font.sans-serif'] = ['SimHei']  #用来正常显示中文标签
+        plt.rcParams['axes.unicode_minus'] = False  #用来正常显示负号
+        keyN = int(PcsMse.shape[0] / 3)
+        fig = plt.figure()
+        ax3d = fig.gca(projection='3d')
+        for k in range(0, keyN):
+            Pc = PcsMse[(k * 3):(k * 3 + 3), 0:6]
+            Pt = Pts[(k * 3):(k * 3 + 3), :]
+            hpPc, = ax3d.plot(Pc[0, :], Pc[1, :], Pc[2, :], '-o', markersize=4)
+            hpPt, = ax3d.plot(Pt[0, :], Pt[1, :], Pt[2, :], '.', markersize=4)
+        plt.xlabel('x')
+        plt.ylabel('y')
+        plt.show()
+
+
+## 初始化贝塞尔求解器类对象
+Ibs = BezierSolver()
+## 导入关键点序列
+keyX, keyV, keyA = UnityQUAVapi.LoadXVData('AB_XV.txt', addO=False)
+## 求解各段贝塞尔控制点
+PcsMse = Ibs.Solve_B5Special(keyX, keyV, keyA)
+## 强行将贝塞尔控制点退化为两个点，实现Stop-To-Go的形式
+PcsMse[:, 1] = PcsMse[:, 0]
+PcsMse[:, 2] = PcsMse[:, 0]
+PcsMse[:, 3] = PcsMse[:, 5]
+PcsMse[:, 4] = PcsMse[:, 5]
+## 求解各段轨迹
+Pts = Ibs.GetPt(PcsMse)
+# ## 绘制三维轨迹
+# Ibs.ShowPlot3(PcsMse, Pts)
+
+## 初始化接口类对象
+uQUAV = UnityQUAV()
+LoadUAV()
+uQUAV.Reset()
+uQUAV.Show()
+time.sleep(0.5)
+## 在Unity中进行渲染
+keyN = int(Pts.shape[0] / 3)
+tN = Pts.shape[1]
+for k in range(0, keyN):
+    Pt = Pts[(k * 3):(k * 3 + 3), :]
+    for tk in range(0, tN):
+        uQUAV.IMoveTo(Pt[0, tk], Pt[1, tk], Pt[2, tk])
+        uQUAV.Show()
+        time.sleep(0.01)  #延时等待

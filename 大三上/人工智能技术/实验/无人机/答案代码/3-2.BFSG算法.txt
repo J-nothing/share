@@ -1,0 +1,402 @@
+#coding:utf-8
+#计算空中vPoints并规划一条平滑的轨迹实现遍历
+from UnityQUAVapi import UnityQUAV
+import UnityQUAVapi
+import time
+import numpy as np
+from scipy.special import comb
+import os
+
+
+class BezierSolver:
+    def __init__(self):
+        pass
+
+    def SolvePoly5(self, Dm0, Dm1, DDm0, DDm1, t):
+        '''
+            输入参数Dm0,Dm1,DDm0,DDm1为标量，t为时间行向量
+            输出参数C为多项式系数行向量[c0 c1 c2 c3 c4 c5]
+            输出参数m为函数值行向量m(t)
+                m(t)要求t从0变到tf,m从0变到1
+                m取值不得超出[0,1]区间
+                m(0)==0;        m(tf)==1;
+                m'(0)==Dm0;     m'(tf)==Dm1;
+                m''(0)==DDm0;   m''(tf)==DDm1;
+            取五次多项式曲线m(t)=[c0 c1 c2 c3 c4 c5]*[t.^0; t.^1; t.^2; t.^3; t.^4; t.^5]即可
+        '''
+        tf = t[-1]
+        b = np.asarray([0, 1, Dm0, Dm1, DDm0, DDm1]).reshape([6, 1])
+        A=np.asarray([ \
+                       1,0,0,0,0,0,
+                       1,tf,tf**2,tf**3,tf**4,tf**5,
+                       0,1,0,0,0,0,
+                       0,1,2*tf,3*tf**2,4*tf**3,5*tf**4,
+                       0,0,2,0,0,0,
+                       0,0,2,6*tf,12*tf**2,20*tf**3
+                    ]).reshape([6, 6])
+        C = np.linalg.inv(A).dot(b).T
+        tM = np.vstack([t * 0 + 1, t**1, t**2, t**3, t**4, t**5])
+        m = C.dot(tM)
+        return m
+
+    def Solve_B5Special_SE(self, Xs, Xe, Vs, Ve, As, Ae, Dms=[1, 1, 0, 0]):
+        '''
+            Xs,Xe,Vs,Ve,As,Ae均为numpy.ndarray类型，且shape为(3, 1)
+            即传入的都是三维列向量
+            依次代表起止的位置、速度、加速度
+            本函数利用五阶贝塞尔进行两点间轨迹规划，随便求一个可行解就行
+        '''
+        Dm0 = Dms[0]
+        Dm1 = Dms[1]
+        DDm0 = Dms[2]
+        DDm1 = Dms[3]
+        P0 = Xs
+        P5 = Xe
+        P1 = P0 + Vs / 5 / Dm0
+        P2 = (As - Vs / Dm0 * DDm0) / (20 * Dm0 * Dm0) - P0 + 2 * P1
+        P4 = P5 - Ve / 5 / Dm1
+        P3 = (Ae - Ve / Dm1 * DDm1) / (20 * Dm1 * Dm1) - P5 + 2 * P4
+
+        Pc = np.column_stack([P0, P1, P2, P3, P4, P5])
+        M0 = np.row_stack([0.0, Dm0, DDm0])  #[m(0) ; m'(0) ; m''(0)]
+        M1 = np.row_stack([1, Dm1, DDm1])  #[m(tf) ; m'(tf) ; m''(tf)]
+        return Pc, M0, M1
+
+    def Solve_B5Special(self, keyX, keyV, keyA, Dms=[0.05, 0.05, 0, 0]):
+        '''
+            PcsMse每三行存相邻两关键点之间规划得到的贝塞尔曲线信息[P M0 M1]
+            P为3行BezierN+1列，为各个控制点并联
+            M0为3行1列，为[m(0) ; m'(0) ; m''(0)]
+            M1为3行1列，为[m(tf) ; m'(tf) ; m''(tf)]
+        '''
+        keyN = keyX.shape[1]
+        BezierN = 5
+        PcsMse = np.zeros([3 * (keyN - 1), BezierN + 1 + 2], dtype=np.float64)
+        #遍历关键点序列，对每组相邻两关键点求解
+        for k in range(0, keyN - 1):
+            Xs = keyX[:, k].copy()
+            Xe = keyX[:, k + 1].copy()
+            Vs = keyV[:, k].copy()
+            Ve = keyV[:, k + 1].copy()
+            As = keyA[:, k].copy()
+            Ae = keyA[:, k + 1].copy()
+            Pc, M0, M1 = self.Solve_B5Special_SE(Xs, Xe, Vs, Ve, As, Ae, Dms)
+            PcsMse[3 * k:(3 * k + 3), 0:(BezierN + 1)] = Pc
+            PcsMse[3 * k:(3 * k + 3), BezierN + 1] = M0[:, 0]
+            PcsMse[3 * k:(3 * k + 3), BezierN + 2] = M1[:, 0]
+        return PcsMse
+
+    def GetPt(self, PcsMse, tf=1, tN=300):
+        '''
+            Pts每三行存一段时域轨迹的x y z坐标
+        '''
+        t = np.linspace(0, tf, tN)
+        keyN = int(PcsMse.shape[0] / 3)
+        BezierN = PcsMse.shape[1] - 2 - 1
+        C=np.asarray( \
+                      [comb(BezierN,k) for k in range(0,BezierN+1)],
+                      dtype=np.float64
+                    ).reshape([BezierN+1,1])
+        Pts = np.zeros([keyN * 3, tN])
+        for k in range(0, keyN):
+            Pc = PcsMse[(k * 3):(k * 3 + 3), 0:6]
+            Dm0 = PcsMse[k * 3 + 1, 6]
+            Dm1 = PcsMse[k * 3 + 1, 7]
+            DDm0 = PcsMse[k * 3 + 2, 6]
+            DDm1 = PcsMse[k * 3 + 2, 7]
+            m = self.SolvePoly5(Dm0, Dm1, DDm0, DDm1, t)
+            RList = [(m**k) * (1 - m)**(BezierN - k)
+                     for k in range(0, BezierN + 1)]
+            Pts[(k * 3):(k * 3 + 3), :] = Pc.dot(C * np.row_stack(RList))
+        return Pts
+
+    def ShowPlot3(self, PcsMse, Pts):
+        '''
+            绘制三维可视化结果
+        '''
+        import matplotlib as mplt
+        import matplotlib.pyplot as plt
+        from mpl_toolkits.mplot3d import Axes3D
+        plt.rcParams['font.sans-serif'] = ['SimHei']  #用来正常显示中文标签
+        plt.rcParams['axes.unicode_minus'] = False  #用来正常显示负号
+        keyN = int(PcsMse.shape[0] / 3)
+        fig = plt.figure()
+        ax3d = fig.gca(projection='3d')
+        for k in range(0, keyN):
+            Pc = PcsMse[(k * 3):(k * 3 + 3), 0:6]
+            Pt = Pts[(k * 3):(k * 3 + 3), :]
+            hpPc, = ax3d.plot(Pc[0, :], Pc[1, :], Pc[2, :], '-o', markersize=4)
+            hpPt, = ax3d.plot(Pt[0, :], Pt[1, :], Pt[2, :], '.', markersize=4)
+        plt.xlabel('x')
+        plt.ylabel('y')
+        plt.show()
+
+
+class MountainSolver:
+    def __init__(self):
+        self.X = np.loadtxt('X.txt')
+        self.Y = np.loadtxt('Y.txt')
+        self.Z = np.loadtxt('Z.txt')
+
+    def GetNormalVector(self, CurrCx, CurrCy):
+        '''
+            计算山体表面离所给点(CurrCx,CurrCy)最近的格点
+            并求解该格点处的单位法向量
+        '''
+        eDis2 = (self.X - CurrCx)**2 + (self.Y - CurrCy)**2
+        Idx = np.where(eDis2.min() == eDis2)
+        row = Idx[0][0]
+        col = Idx[1][0]
+        CPoint=np.asarray([ \
+                            self.X[row, col],
+                            self.Y[row, col],
+                            self.Z[row, col],
+                         ]).reshape(3,1)
+        CIdx = [row, col]
+        # 八邻域相对位置(正右开始逆时针转动[dRow,dCol])
+        eightDirect = [ \
+                        [0, 1],
+                        [-1, 1],
+                        [-1, 0],
+                        [-1, -1],
+                        [0, -1],
+                        [1, -1],
+                        [1, 0],
+                        [1, 1]
+                      ]
+        # 指向八个方向的向量
+        eightCDVList = []
+        for i in range(0, 8):
+            CDV = np.asarray([ \
+                               self.X[row + eightDirect[i][0], col + eightDirect[i][1]],
+                               self.Y[row + eightDirect[i][0], col + eightDirect[i][1]],
+                               self.Z[row + eightDirect[i][0], col + eightDirect[i][1]],
+                            ]).reshape(3, 1) - CPoint
+            eightCDVList.append(CDV)
+        eightCDVList.append(eightCDVList[0])
+        # 相邻方向向量叉乘得到的八个近似法向量
+        eightCNVList = []
+        for i in range(0, 8):
+            CNV = np.cross(eightCDVList[i], eightCDVList[i + 1], axis=0)
+            eightCNVList.append(CNV / np.linalg.norm(CNV))
+        eightCNV = np.hstack(eightCNVList)
+        # 八个近似法向量取平均即为正式法向量
+        CNV = eightCNV.mean(axis=1).reshape(3, 1)
+        CNV = CNV / np.linalg.norm(CNV)
+        return CNV, CPoint, CIdx
+
+    def GetVpoints(self, cW=512, cH=288, cWr=0.3, cHr=0.2, dis=466):
+        '''
+            根据等距正视约束计算空中vPoints
+            相机视野宽度高度依次为cW、cH
+            相机视野横向重合率、纵向重合率依次为cWr、cHr
+            等距所指的距离为dis
+        '''
+        ## 定义左上角与右下角
+        Xstart=np.asarray([ \
+                            self.X[0,0],
+                            self.Y[0,0],
+                            self.Z[0,0]
+                         ]).reshape(3,1)
+        Xend=np.asarray([ \
+                          self.X[-1,-1],
+                          self.Y[-1,-1],
+                          self.Z[-1,-1]
+                        ]).reshape(3,1)
+        ## 求相机中心点位置序列
+        W = Xend[0] - Xstart[0]
+        H = Xend[1] - Xstart[1]
+        # 恰好有ciN*cW-(ciN+1)*cW*cWr≥W
+        ciN = 1 + int((W + cW * cWr) / (cW - cW * cWr))
+        # 恰好有cjN*cH-(cjN+1)*cH*cHr≥H
+        cjN = 1 + int((H + cH * cHr) / (cH - cH * cHr))
+        # 遍历网格进行寻找
+        CNVList = []
+        CPointsList = []
+        CIdxsList = []
+        VPointsList = []
+        dLabel = 1
+        for ci in range(1, ciN + 1):
+            CurrCx = Xstart[0] + ci * (cW - cW * cWr) - cW / 2
+            for cj in range(1 * (dLabel == 1) + cjN * (dLabel == -1),
+                            (cjN + 1) * (dLabel == 1), dLabel):
+                CurrCy = Xstart[1] + cj * (cH - cH * cHr) - cH / 2
+                CNV, CPoint, CIdx = self.GetNormalVector(CurrCx, CurrCy)
+                VPoint = CPoint + CNV * dis
+                CNVList.append(CNV)
+                CPointsList.append(CPoint)
+                CIdxsList.append(CIdx)
+                VPointsList.append(VPoint)
+            dLabel = -dLabel  #实现之字形遍历
+        self.CNVs = np.hstack(CNVList)
+        self.CPoints = np.hstack(CPointsList)
+        self.CIdxsList = CIdxsList
+        self.VPoints = np.hstack(VPointsList)
+        self.KeyX = np.hstack([Xstart * 0] + VPointsList + [Xend * 0])
+        self.KeyV = self.KeyX * 0
+        self.KeyA = self.KeyX * 0
+
+    def SolveDisTSP(self):
+        '''
+            求解基于距离的TSP问题，得到比较优秀的遍历顺序
+            由于遗传算法求解比较耗时，应该离线进行
+            故此处采用os.system()函数终端调用命令
+            如果已有离线进行的结果则不再调用，从而加快速度
+            如此一来，对于特定山体，第一次调用会比较费时，之后就不费时了
+        '''
+        ## 强行把遍历顺序改为之字形遍历
+        KeyX_N = self.KeyX.shape[1]
+        pyI = np.linspace(0, KeyX_N - 1, KeyX_N)
+        pyV = np.asarray([np.nan])
+        self.pyVI = np.hstack([pyV, pyI])
+        return
+        try:
+            pyVI = np.loadtxt('./WorkSpace/pyVI-GenTotal_2000.res')
+            if pyVI.shape[0] - 1 == self.KeyX.shape[1] \
+               and pyVI[1:].max() == self.KeyX.shape[1]-1 \
+               and pyVI[1:].min() == 0 \
+               and pyVI[1] == 0 \
+               and pyVI[-1] == self.KeyX.shape[1]-1:
+                self.pyVI = pyVI
+                return
+        except BaseException:
+            pass
+        ## 生成TSPmain.py所需的文件
+        DstDir = './WorkSpace'
+        if not os.path.exists(DstDir):
+            os.makedirs(DstDir)
+        fid = open('./keyXVA.txt', 'wb')
+        np.savetxt(fid,
+                   np.vstack([self.KeyX, self.KeyV, self.KeyA]),
+                   fmt='%.17g',
+                   delimiter=' ',
+                   newline='\n',
+                   header='',
+                   footer='',
+                   comments='# ')
+        fid.close()
+        ## 终端调用TSPmain.py求解
+        cmdStr = 'python3 TSPmain.py -res ./WorkSpace/pyVI-GenTotal_2000.res -Nind 100 -MGen 2000 -drawType 0'
+        os.system(cmdStr)
+        ## 读取求解结果
+        self.pyVI = np.loadtxt('./WorkSpace/pyVI-GenTotal_2000.res')
+
+    def SolveBezier(self):
+        '''
+            在遗传算法TSP遍历顺序基础上进行贝塞尔规划
+        '''
+        ## 初始化贝塞尔求解器类对象
+        Ibs = BezierSolver()
+        ## 导入关键点序列
+        keyX = self.KeyX[:, self.pyVI[1:].astype('int')]
+        keyV = self.KeyV[:, self.pyVI[1:].astype('int')] * 0
+        keyV[:, 1:-1] = keyX[:, 2:] - keyX[:, 1:-1]
+        keyV[:, 1:-1] = keyV[:, 1:-1] / np.linalg.norm(keyV[:, 1:-1], axis=0)
+        keyV[:, 1:-1] = keyV[:, 1:-1] * 17
+        keyA = self.KeyA[:, self.pyVI[1:].astype('int')]
+        ## 求解各段贝塞尔控制点
+        self.PcsMse = Ibs.Solve_B5Special(keyX, keyV, keyA)
+        ## 强行将贝塞尔控制点退化为两个点，实现Stop-To-Go的形式
+        self.PcsMse[:, 1] = self.PcsMse[:, 0]
+        self.PcsMse[:, 2] = self.PcsMse[:, 0]
+        self.PcsMse[:, 3] = self.PcsMse[:, 5]
+        self.PcsMse[:, 4] = self.PcsMse[:, 5]
+        ## 求解各段轨迹
+        self.Pts = Ibs.GetPt(self.PcsMse)
+
+    def Show(self):
+        '''
+            绘制三维图
+        '''
+        import matplotlib as mplt
+        import matplotlib.pyplot as plt
+        from mpl_toolkits.mplot3d import Axes3D
+        plt.rcParams['font.sans-serif'] = ['SimHei']  #用来正常显示中文标签
+        plt.rcParams['axes.unicode_minus'] = False  #用来正常显示负号
+        fig = plt.figure()
+        ax3d = fig.gca(projection='3d')
+        # 绘制山体
+        ax3d.plot_surface(self.X, self.Y, self.Z, alpha=0.8)
+        # 绘制相机中心点
+        ax3d.plot(self.CPoints[0],
+                  self.CPoints[1],
+                  self.CPoints[2],
+                  '-p',
+                  markersize=7)
+        # 绘制空中视点
+        ax3d.plot(self.VPoints[0],
+                  self.VPoints[1],
+                  self.VPoints[2],
+                  'p',
+                  markersize=4)
+        # 绘制法线
+        for k in range(0, self.CPoints.shape[1]):
+            ax3d.plot(np.hstack([self.CPoints[0, [k]], self.VPoints[0, [k]]]),
+                      np.hstack([self.CPoints[1, [k]], self.VPoints[1, [k]]]),
+                      np.hstack([self.CPoints[2, [k]], self.VPoints[2, [k]]]),
+                      'k-.',
+                      alpha=0.5)
+        # 绘制TSP优化后的遍历顺序
+        TSPpath = self.KeyX[:, self.pyVI[1:].astype('int')]
+        ax3d.plot(TSPpath[0], TSPpath[1], TSPpath[2], '--', alpha=0.5)
+        # 绘制贝塞尔轨迹
+        for k in range(0, int(self.PcsMse.shape[0] / 3)):
+            Pc = self.PcsMse[(k * 3):(k * 3 + 3), 0:6]
+            Pt = self.Pts[(k * 3):(k * 3 + 3), :]
+            hpPc, = ax3d.plot(Pc[0, :],
+                              Pc[1, :],
+                              Pc[2, :],
+                              '--o',
+                              markersize=4,
+                              alpha=0.5)
+            hpPt, = ax3d.plot(Pt[0, :], Pt[1, :], Pt[2, :], '.', markersize=1)
+        # 通过额外的边界点设置坐标轴等尺度
+        axisEqual = True
+        if axisEqual:
+            ValueMIN = min(self.X.min(), self.Y.min(), self.Z.min())
+            ValueMAX = max(self.X.max(), self.Y.max(), self.Z.max())
+            ax3d.plot( \
+                       [ValueMIN, ValueMAX],
+                       [ValueMIN, ValueMAX],
+                       [ValueMIN, ValueMAX],
+                       '.',
+                       alpha=0
+                     )
+        # 其他
+        plt.xlabel('x')
+        plt.ylabel('y')
+        plt.show()
+
+
+if __name__ == '__main__':
+    # 生成山体规划求解器对象
+    Ims = MountainSolver()
+    # 根据等距正视约束计算空中视点
+    Ims.GetVpoints()
+    # 基于距离指标用遗传算法求解TSP遍历顺序
+    Ims.SolveDisTSP()
+    # 路径平滑得到轨迹
+    Ims.SolveBezier()
+    # # 绘制三维结果
+    # Ims.Show()
+
+    SetCamera(1);
+    TSPproblem();
+    ClearTrail();
+
+    ## 初始化接口类对象
+    uQUAV = UnityQUAV()
+    LoadUAV()
+    uQUAV.Reset()
+    uQUAV.Show()
+    time.sleep(1)
+    ## 在Unity中进行渲染
+    Pts = Ims.Pts
+    keyN = int(Pts.shape[0] / 3)
+    tN = Pts.shape[1]
+    for k in range(0, keyN):
+        Pt = Pts[(k * 3):(k * 3 + 3), :]
+        for tk in range(0, tN):
+            uQUAV.IMoveTo(Pt[0, tk], Pt[1, tk], Pt[2, tk])
+            uQUAV.Show()
+            time.sleep(0.01)  #延时等待

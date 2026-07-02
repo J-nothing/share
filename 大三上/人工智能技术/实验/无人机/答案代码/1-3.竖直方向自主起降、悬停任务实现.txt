@@ -1,0 +1,20 @@
+#coding:utf-8
+#无人机位移函数,请将无人机悬停至4米高度，并悬停1秒
+
+from UnityQUAVapi import UnityQUAV
+import time
+uQUAV = UnityQUAV()
+FrameN = 233
+pi = 3.1415926535897932384626
+DeltaAlpha = pi / 180  # 起飞时旋翼转速(弧度每帧)
+for k in range(0, FrameN + 1):
+    uQUAV.IMove(0, 0, 4 / FrameN)
+    uQUAV.Show(DeltaAlpha)
+    time.sleep(0.01)  #延时等待
+for k in range(0, 101):
+    uQUAV.Show(DeltaAlpha)
+    time.sleep(0.01)  #延时等待
+for k in range(0, FrameN + 1):
+    uQUAV.IMove(0, 0, -4 / FrameN)
+    uQUAV.Show(DeltaAlpha)
+    time.sleep(0.01)  #延时等待

@@ -1,0 +1,15 @@
+#coding:utf-8
+#无人机原位驱动调试
+from UnityQUAVapi import UnityQUAV
+import time
+uQUAV = UnityQUAV()
+pi = 3.1415926535897932384626
+DeltaAlpha = pi / 180  # 起飞时旋翼转速(弧度每帧)
+#旋翼慢慢加速
+for k in range(0, 201):
+    uQUAV.Show(DeltaAlpha * (k / 200))
+    time.sleep(0.01)  #延时等待
+#旋翼慢慢停转
+for k in range(0, 201):
+    uQUAV.Show(DeltaAlpha * (1 - k / 200))
+    time.sleep(0.01)  #延时等待
