@@ -1,0 +1,2 @@
+MATLAB绘图成功！
+图像路径: E:\NKUer\2025~2026第一学期\信号与系统\作业\作业三绘图\ak_magnitude_phase.png
